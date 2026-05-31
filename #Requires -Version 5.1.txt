@@ -1,0 +1,1278 @@
+﻿#Requires -Version 5.1
+<#
+═══════════════════════════════════════════════════════════════════════════════
+  GamingOptimizer Pro v2.0  |  Windows Gaming Performance Suite
+  ─────────────────────────────────────────────────────────────────────────────
+  OBJETIVO : Maximizar FPS, reducir frametimes, input lag, DPC latency.
+  HARDWARE : NVIDIA / AMD / Intel GPU  |  Intel / AMD CPU  |  SSD / NVMe / HDD
+  SO       : Windows 10 (Build 1903+) / Windows 11
+  EJECUCIÓN: PowerShell como Administrador
+  LOG      : %USERPROFILE%\Desktop\GamingOptimizer_Log.txt
+  BACKUP   : %USERPROFILE%\Desktop\GamingOptimizer_Backup\
+═══════════════════════════════════════════════════════════════════════════════
+#>
+
+# ── Execution Policy & Error Handling ─────────────────────────────────────────
+$ErrorActionPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GLOBALS
+# ══════════════════════════════════════════════════════════════════════════════
+$Global:ScriptVersion = "2.0.0"
+$Global:LogPath = "$env:USERPROFILE\Desktop\GamingOptimizer_Log.txt"
+$Global:BackupPath = "$env:USERPROFILE\Desktop\GamingOptimizer_Backup"
+$Global:Applied = 0
+$Global:Skipped = 0
+$Global:Errors = 0
+$Global:NotFound = 0
+$Global:HW = @{}
+$Global:OptLog = [System.Collections.Generic.List[hashtable]]::new()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UTILITIES — LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$ts][$Level] $Message"
+    Add-Content -Path $Global:LogPath -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+function Write-Header {
+    param([string]$Title)
+    $bar = '─' * 68
+    Write-Host ""
+    Write-Host "  $bar" -ForegroundColor Cyan
+    Write-Host "  █  $($Title.ToUpper())" -ForegroundColor Cyan
+    Write-Host "  $bar" -ForegroundColor Cyan
+}
+
+function Write-Status {
+    param([string]$Item, [string]$Status, [string]$Detail = "")
+    $icon = '-'
+    $color = 'White'
+    switch ($Status) {
+        'APPLIED' { $icon = ([char]0x2713).ToString(); $color = 'Green' }
+        'SKIPPED' { $icon = 'o'; $color = 'Yellow' }
+        'ERROR' { $icon = 'X'; $color = 'Red' }
+        'NOT_FOUND' { $icon = '?'; $color = 'DarkGray' }
+        'INFO' { $icon = 'i'; $color = 'Cyan' }
+    }
+    Write-Host "    [$icon] " -NoNewline -ForegroundColor $color
+    Write-Host "$($Status.PadRight(10))" -NoNewline -ForegroundColor $color
+    Write-Host " $Item" -NoNewline -ForegroundColor White
+    if ($Detail) { Write-Host " -> $Detail" -ForegroundColor DarkGray } else { Write-Host "" }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UTILITIES — TRACKING
+# ══════════════════════════════════════════════════════════════════════════════
+function Record-Opt {
+    param([string]$Mod, [string]$Name, [string]$Status, [string]$Detail = "")
+    $r = @{ Module = $Mod; Name = $Name; Status = $Status; Detail = $Detail; Time = (Get-Date -Format "HH:mm:ss") }
+    $Global:OptLog.Add($r)
+    switch ($Status) {
+        'APPLIED' { $Global:Applied++ }
+        'SKIPPED' { $Global:Skipped++ }
+        'ERROR' { $Global:Errors++ }
+        'NOT_FOUND' { $Global:NotFound++ }
+    }
+    Write-Status -Item $Name -Status $Status -Detail $Detail
+    Write-Log -Message "[$Mod] $Name => $Status $(if($Detail){"($Detail)"})" -Level $Status
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UTILITIES — USER PROMPT
+# ══════════════════════════════════════════════════════════════════════════════
+function Ask-User {
+    param([string]$Question, [string]$Default = "Y")
+    Write-Host ""
+    Write-Host "  >> $Question " -NoNewline -ForegroundColor Yellow
+    if ($Default -eq "Y") { Write-Host "[Y/n]: " -NoNewline -ForegroundColor DarkGray }
+    else { Write-Host "[y/N]: " -NoNewline -ForegroundColor DarkGray }
+    $r = Read-Host
+    if ([string]::IsNullOrWhiteSpace($r)) { $r = $Default }
+    return ($r -match '^[Yy]')
+}
+
+function Ask-Module {
+    param([string]$ModName, [string]$Desc)
+    Write-Host ""
+    Write-Host "  +============================================================+" -ForegroundColor Magenta
+    Write-Host "  |  MODULO : $($ModName.PadRight(50))|" -ForegroundColor Magenta
+    Write-Host "  |  $($Desc.PadRight(60))|" -ForegroundColor DarkGray
+    Write-Host "  +============================================================+" -ForegroundColor Magenta
+    return (Ask-User -Question "Ejecutar este modulo?" -Default "Y")
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UTILITIES — REGISTRY
+# ══════════════════════════════════════════════════════════════════════════════
+function Set-RegVal {
+    param(
+        [string]$Mod, [string]$Name,
+        [string]$Path, [string]$Key,
+        $Value, [string]$Type = "DWord"
+    )
+    try {
+        if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+        $cur = (Get-ItemProperty -Path $Path -Name $Key -ErrorAction SilentlyContinue).$Key
+        if ($null -ne $cur -and "$cur" -eq "$Value") {
+            Record-Opt $Mod $Name 'SKIPPED' "Ya configurado ($Key=$Value)"
+            return
+        }
+        Set-ItemProperty -Path $Path -Name $Key -Value $Value -Type $Type -Force
+        Record-Opt $Mod $Name 'APPLIED' "$Key = $Value"
+    }
+    catch { Record-Opt $Mod $Name 'ERROR' $_.Exception.Message }
+}
+
+function Remove-RegVal {
+    param([string]$Mod, [string]$Name, [string]$Path, [string]$Key)
+    try {
+        if (-not (Test-Path $Path)) { Record-Opt $Mod $Name 'NOT_FOUND' "Ruta no existe"; return }
+        if ($null -eq (Get-ItemProperty -Path $Path -Name $Key -ErrorAction SilentlyContinue)) {
+            Record-Opt $Mod $Name 'NOT_FOUND' "Clave no existe"
+            return
+        }
+        Remove-ItemProperty -Path $Path -Name $Key -Force
+        Record-Opt $Mod $Name 'APPLIED' "Clave eliminada"
+    }
+    catch { Record-Opt $Mod $Name 'ERROR' $_.Exception.Message }
+}
+
+function Backup-RegKey {
+    param([string]$RegPath, [string]$Name)
+    try {
+        $dir = "$Global:BackupPath\Registry"
+        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        reg export $RegPath "$dir\$Name.reg" /y 2>$null | Out-Null
+    }
+    catch {}
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UTILITIES — SERVICES
+# ══════════════════════════════════════════════════════════════════════════════
+function Disable-SvcSafe {
+    param([string]$Mod, [string]$SvcName, [string]$Label, [string]$StartType = "Disabled")
+    try {
+        $svc = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
+        if ($null -eq $svc) { Record-Opt $Mod $Label 'NOT_FOUND' "Servicio inexistente"; return }
+        if ($svc.StartType.ToString() -eq $StartType) { Record-Opt $Mod $Label 'SKIPPED' "Ya es $StartType"; return }
+        Stop-Service -Name $SvcName -Force -ErrorAction SilentlyContinue
+        Set-Service  -Name $SvcName -StartupType $StartType -ErrorAction Stop
+        Record-Opt $Mod $Label 'APPLIED' "-> $StartType"
+    }
+    catch { Record-Opt $Mod $Label 'ERROR' $_.Exception.Message }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BANNER
+# ══════════════════════════════════════════════════════════════════════════════
+function Show-Banner {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ##############################################################" -ForegroundColor Cyan
+    Write-Host "  ##                                                          ##" -ForegroundColor Cyan
+    Write-Host "  ##     GAMING OPTIMIZER PRO  v2.0                          ##" -ForegroundColor Cyan
+    Write-Host "  ##     Windows Gaming Performance Suite                    ##" -ForegroundColor Cyan
+    Write-Host "  ##                                                          ##" -ForegroundColor Cyan
+    Write-Host "  ##   CPU/GPU/RAM/NET/SSD/NVMe   |   Win10 / Win11          ##" -ForegroundColor DarkCyan
+    Write-Host "  ##   NVIDIA / AMD / Intel        |   FPS + Input Lag        ##" -ForegroundColor DarkCyan
+    Write-Host "  ##                                                          ##" -ForegroundColor Cyan
+    Write-Host "  ##############################################################" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Objetivos: FPS | Frametime | Input Lag | DPC Latency | Stabilidad" -ForegroundColor Magenta
+    Write-Host ""
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 0 — AUDITORIA DEL SISTEMA
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-SystemAudit {
+    Write-Header "AUDITORIA DEL SISTEMA"
+    Write-Host "  Analizando hardware y configuracion del sistema..." -ForegroundColor Cyan
+
+    # ── Windows ───────────────────────────────────────────────
+    $os = Get-CimInstance Win32_OperatingSystem
+    $Global:HW.WinCaption = $os.Caption
+    $Global:HW.WinBuild = $os.BuildNumber
+    $Global:HW.WinBuildInt = [int]$os.BuildNumber
+    $Global:HW.WinArch = $os.OSArchitecture
+    $Global:HW.WinEdition = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue).EditionID
+    $Global:HW.IsWin11 = ($Global:HW.WinBuildInt -ge 22000)
+
+    # ── CPU ───────────────────────────────────────────────────
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $Global:HW.CPU = $cpu.Name.Trim()
+    $Global:HW.CPUCores = $cpu.NumberOfCores
+    $Global:HW.CPUThreads = $cpu.NumberOfLogicalProcessors
+    $Global:HW.CPUMaxMHz = $cpu.MaxClockSpeed
+    $Global:HW.IsIntelCPU = $cpu.Manufacturer -match "Intel"
+    $Global:HW.IsAMDCPU = $cpu.Manufacturer -match "AMD"
+    $Global:HW.CPUMfr = if ($Global:HW.IsIntelCPU) { "Intel" } elseif ($Global:HW.IsAMDCPU) { "AMD" } else { "Unknown" }
+
+    # L2 / L3 cache (MaxCacheSize in KB, Level 4=L2, Level 5=L3)
+    $cacheInfo = Get-CimInstance Win32_CacheMemory -ErrorAction SilentlyContinue
+    $Global:HW.L2CacheKB = [int](($cacheInfo | Where-Object Level -eq 4 | Measure-Object MaxCacheSize -Sum).Sum)
+    $Global:HW.L3CacheKB = [int](($cacheInfo | Where-Object Level -eq 5 | Measure-Object MaxCacheSize -Sum).Sum)
+
+    # ── RAM ───────────────────────────────────────────────────
+    $ramMods = Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue
+    $Global:HW.RAMTotalGB = [Math]::Round(($ramMods | Measure-Object Capacity -Sum).Sum / 1GB, 1)
+    $Global:HW.RAMFreqMHz = ($ramMods | Select-Object -First 1).Speed
+    $Global:HW.RAMSlots = @($ramMods).Count
+    $smType = ($ramMods | Select-Object -First 1).SMBIOSMemoryType
+    $Global:HW.RAMType = switch ($smType) {
+        20 { "DDR" }; 21 { "DDR2" }; 24 { "DDR3" }; 26 { "DDR4" }; 34 { "DDR5" }; default { "DDR4" }
+    }
+
+    # ── GPU ───────────────────────────────────────────────────
+    $gpus = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
+    $primary = $gpus | Sort-Object AdapterRAM -Descending | Select-Object -First 1
+    $Global:HW.GPUPrimary = $primary.Name
+    $Global:HW.GPUVRAMGB = [Math]::Round($primary.AdapterRAM / 1GB, 1)
+    $Global:HW.HasNVIDIA = ($gpus | Where-Object { $_.Name -match "NVIDIA" }).Count -gt 0
+    $Global:HW.HasAMDGPU = ($gpus | Where-Object { $_.Name -match "AMD|Radeon" }).Count -gt 0
+    $Global:HW.HasIntelGPU = ($gpus | Where-Object { $_.Name -match "Intel" }).Count -gt 0
+    $Global:HW.GPUs = $gpus
+    $Global:HW.RefreshRate = $primary.CurrentRefreshRate
+    if (-not $Global:HW.RefreshRate) { $Global:HW.RefreshRate = 60 }
+
+    # ── Storage ───────────────────────────────────────────────
+    $disks = Get-PhysicalDisk -ErrorAction SilentlyContinue
+    $Global:HW.HasSSD = ($disks | Where-Object MediaType -eq "SSD").Count -gt 0
+    $Global:HW.HasHDD = ($disks | Where-Object MediaType -eq "HDD").Count -gt 0
+    $Global:HW.HasNVMe = ($disks | Where-Object BusType -eq "NVMe").Count -gt 0
+    $Global:HW.Disks = $disks
+
+    # ── Motherboard / BIOS ────────────────────────────────────
+    $board = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue
+    $bios = Get-CimInstance Win32_BIOS      -ErrorAction SilentlyContinue
+    $Global:HW.Motherboard = "$($board.Manufacturer) $($board.Product)".Trim()
+    $Global:HW.BIOSVersion = $bios.SMBIOSBIOSVersion
+
+    # UEFI detection
+    try {
+        $Global:HW.SecureBoot = (Confirm-SecureBootUEFI -ErrorAction Stop)
+        $Global:HW.IsUEFI = $true
+    }
+    catch {
+        $Global:HW.IsUEFI = (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State")
+        $Global:HW.SecureBoot = $false
+    }
+
+    # TPM
+    $tpm = Get-CimInstance -Namespace "ROOT\CIMV2\Security\MicrosoftTpm" -ClassName Win32_Tpm -ErrorAction SilentlyContinue
+    $Global:HW.HasTPM = ($null -ne $tpm)
+    $Global:HW.TPMVer = if ($tpm) { $tpm.SpecVersion } else { "N/A" }
+
+    # ── Network ───────────────────────────────────────────────
+    $Global:HW.NetAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object Status -eq "Up")
+
+    # ── Peripherals ───────────────────────────────────────────
+    $Global:HW.Mouse = Get-CimInstance Win32_PointingDevice -ErrorAction SilentlyContinue
+    $Global:HW.Keyboard = Get-CimInstance Win32_Keyboard       -ErrorAction SilentlyContinue
+
+    # ── System stats ──────────────────────────────────────────
+    $Global:HW.ProcCount = (Get-Process -ErrorAction SilentlyContinue).Count
+    $Global:HW.RunSvcCount = (Get-Service -ErrorAction SilentlyContinue | Where-Object Status -eq "Running").Count
+
+    # ── Display Audit Results ─────────────────────────────────
+    Write-Host ""
+    Write-Host "  +-- SISTEMA OPERATIVO -----------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host "  | OS        : $($Global:HW.WinCaption)" -ForegroundColor White
+    Write-Host "  | Build     : $($Global:HW.WinBuild)  |  Win11: $($Global:HW.IsWin11)  |  $($Global:HW.WinArch)" -ForegroundColor White
+    Write-Host "  | Edicion   : $($Global:HW.WinEdition)  |  UEFI: $($Global:HW.IsUEFI)  |  SecureBoot: $($Global:HW.SecureBoot)  |  TPM: $($Global:HW.HasTPM) ($($Global:HW.TPMVer))" -ForegroundColor White
+    Write-Host "  +-- CPU -------------------------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host "  | Modelo    : $($Global:HW.CPU)" -ForegroundColor White
+    Write-Host "  | Nucleos   : $($Global:HW.CPUCores) cores / $($Global:HW.CPUThreads) threads  |  $($Global:HW.CPUMaxMHz) MHz  |  $($Global:HW.CPUMfr)" -ForegroundColor White
+    Write-Host "  | Cache     : L2 = $($Global:HW.L2CacheKB) KB  |  L3 = $($Global:HW.L3CacheKB) KB" -ForegroundColor White
+    Write-Host "  +-- MEMORIA ---------------------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host "  | RAM       : $($Global:HW.RAMTotalGB) GB $($Global:HW.RAMType) @ $($Global:HW.RAMFreqMHz) MHz  ($($Global:HW.RAMSlots) modulo(s))" -ForegroundColor White
+    Write-Host "  +-- GPU -------------------------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host "  | Principal : $($Global:HW.GPUPrimary)  ($($Global:HW.GPUVRAMGB) GB VRAM)" -ForegroundColor White
+    Write-Host "  | NVIDIA: $($Global:HW.HasNVIDIA)  |  AMD: $($Global:HW.HasAMDGPU)  |  Intel: $($Global:HW.HasIntelGPU)  |  Refresh: $($Global:HW.RefreshRate) Hz" -ForegroundColor White
+    Write-Host "  +-- ALMACENAMIENTO --------------------------------------------+" -ForegroundColor DarkCyan
+    if ($Global:HW.Disks) {
+        foreach ($d in $Global:HW.Disks) {
+            Write-Host "  | $($d.FriendlyName.PadRight(35)) [Tipo:$($d.MediaType)] [Bus:$($d.BusType)]" -ForegroundColor White
+        }
+    }
+    else {
+        Write-Host "  | HDD:$($Global:HW.HasHDD)  |  SSD:$($Global:HW.HasSSD)  |  NVMe:$($Global:HW.HasNVMe)" -ForegroundColor White
+    }
+    Write-Host "  +-- RED -------------------------------------------------------+" -ForegroundColor DarkCyan
+    foreach ($a in $Global:HW.NetAdapters) {
+        Write-Host "  | $($a.Name.PadRight(20)) [$($a.InterfaceDescription)]" -ForegroundColor White
+    }
+    Write-Host "  +-- PLACA BASE ------------------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host "  | $($Global:HW.Motherboard)  |  BIOS: $($Global:HW.BIOSVersion)" -ForegroundColor White
+    Write-Host "  +-- SISTEMA ---------------------------------------------------+" -ForegroundColor DarkCyan
+    Write-Host "  | Procesos activos: $($Global:HW.ProcCount)  |  Servicios en ejecucion: $($Global:HW.RunSvcCount)" -ForegroundColor White
+    Write-Host "  +-------------------------------------------------------------+" -ForegroundColor DarkCyan
+
+    # Log hardware profile
+    Write-Log "=== AUDITORIA DEL SISTEMA ===" "INFO"
+    Write-Log "OS: $($Global:HW.WinCaption) Build $($Global:HW.WinBuild)" "INFO"
+    Write-Log "CPU: $($Global:HW.CPU) [$($Global:HW.CPUCores)C/$($Global:HW.CPUThreads)T @ $($Global:HW.CPUMaxMHz)MHz]" "INFO"
+    Write-Log "RAM: $($Global:HW.RAMTotalGB)GB $($Global:HW.RAMType) @ $($Global:HW.RAMFreqMHz)MHz" "INFO"
+    Write-Log "GPU: $($Global:HW.GPUPrimary) [$($Global:HW.GPUVRAMGB)GB]" "INFO"
+    Write-Log "Storage => HDD:$($Global:HW.HasHDD) SSD:$($Global:HW.HasSSD) NVMe:$($Global:HW.HasNVMe)" "INFO"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 1 — SEGURIDAD: BACKUP Y PUNTO DE RESTAURACION
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-SecurityBackup {
+    Write-Header "MODULO SEGURIDAD — BACKUP Y PUNTO DE RESTAURACION"
+
+    # Crear directorios de backup
+    foreach ($d in @($Global:BackupPath, "$Global:BackupPath\Registry")) {
+        if (-not (Test-Path $d)) { New-Item -Path $d -ItemType Directory -Force | Out-Null }
+    }
+
+    # ── Punto de restauracion ─────────────────────────────────
+    Write-Host "  Creando punto de restauracion del sistema..." -ForegroundColor Cyan
+    try {
+        Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue
+        Checkpoint-Computer -Description "GamingOptimizer Pro v$Global:ScriptVersion - Pre-Optimization" `
+            -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+        Write-Status "Punto de restauracion creado" "APPLIED" "Pre-GamingOptimizer"
+        Write-Log "Punto de restauracion creado OK" "INFO"
+    }
+    catch {
+        Write-Status "Punto de restauracion" "ERROR" $_.Exception.Message
+        Write-Log "Error al crear punto de restauracion: $($_.Exception.Message)" "ERROR"
+    }
+
+    # ── Backup de claves de registro criticas ─────────────────
+    Write-Host "  Exportando claves de registro criticas..." -ForegroundColor Cyan
+    $regBackups = @(
+        @{ Path = "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"; Name = "TCP_Parameters" }
+        @{ Path = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"; Name = "SystemProfile" }
+        @{ Path = "HKLM\SYSTEM\CurrentControlSet\Control\Power"; Name = "PowerSettings" }
+        @{ Path = "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection"; Name = "Telemetry" }
+        @{ Path = "HKCU\Control Panel\Desktop"; Name = "Desktop" }
+        @{ Path = "HKCU\Control Panel\Mouse"; Name = "MouseSettings" }
+        @{ Path = "HKCU\System\GameConfigStore"; Name = "GameConfig" }
+    )
+    foreach ($b in $regBackups) {
+        $f = "$Global:BackupPath\Registry\$($b.Name).reg"
+        reg export $b.Path $f /y 2>$null | Out-Null
+        if (Test-Path $f) {
+            Write-Status "Backup: $($b.Name)" "APPLIED" $f
+        }
+        else {
+            Write-Status "Backup: $($b.Name)" "ERROR" "No exportado"
+        }
+    }
+
+    # ── Exportar servicios actuales ───────────────────────────
+    try {
+        Get-Service | Select-Object Name, DisplayName, Status, StartType |
+        Export-Csv "$Global:BackupPath\Services_Backup.csv" -NoTypeInformation -Encoding UTF8
+        Write-Status "Servicios exportados (CSV)" "APPLIED" "$Global:BackupPath\Services_Backup.csv"
+    }
+    catch {}
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 2 — CPU
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-CPUOptimization {
+    $M = "CPU"
+    if (-not (Ask-Module "CPU OPTIMIZATION" "Power plan, Core Parking, Scheduler, Timer, DPC latency")) { return }
+    Write-Header "MODULO CPU"
+
+    # ── Plan de energia ───────────────────────────────────────
+    if (Ask-User "Activar plan de energia 'Ultimate Performance' (maximo rendimiento)?") {
+        try {
+            $uguid = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+            $hpguid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+            $exists = powercfg /list 2>$null | Select-String $uguid
+            if (-not $exists) { powercfg /duplicatescheme $uguid 2>$null | Out-Null }
+            powercfg /setactive $uguid 2>$null
+            $active = powercfg /getactivescheme 2>$null
+            if ($active -match $uguid) {
+                Record-Opt $M "Plan Ultimate Performance" 'APPLIED' "Activo"
+            }
+            else {
+                powercfg /setactive $hpguid 2>$null
+                Record-Opt $M "Plan High Performance (fallback)" 'APPLIED' "Ultimate no disponible en esta edicion"
+            }
+        }
+        catch { Record-Opt $M "Plan de energia" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "Plan de energia" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Desactivar CPU Core Parking ───────────────────────────
+    if (Ask-User "Desactivar CPU Core Parking (mantiene todos los nucleos activos)?") {
+        try {
+            powercfg /setacvalueindex scheme_current sub_processor CPMINCORES 100 2>$null
+            powercfg /setdcvalueindex scheme_current sub_processor CPMINCORES 100 2>$null
+            powercfg /setactive scheme_current 2>$null
+            # Registry path for the parking setting
+            $pkPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00\0cc5b647-c1df-4637-891a-dec35c318583"
+            Set-RegVal $M "CPU Parking ValueMin" $pkPath "ValueMin" 100
+            Set-RegVal $M "CPU Parking ValueMax" $pkPath "ValueMax" 100
+            Record-Opt $M "CPU Core Parking desactivado" 'APPLIED' "100% nucleos activos"
+        }
+        catch { Record-Opt $M "CPU Core Parking" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "CPU Core Parking" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Desactivar Power Throttling ───────────────────────────
+    if (Ask-User "Desactivar Power Throttling? (reduce interferencias del OS al limitar CPU)") {
+        Set-RegVal $M "PowerThrottlingOff" `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling" `
+            "PowerThrottlingOff" 1
+    }
+    else { Record-Opt $M "Power Throttling" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Multimedia Class Scheduler (MMCSS) ────────────────────
+    if (Ask-User "Optimizar Multimedia Class Scheduler para gaming? (prioridad GPU/CPU en juegos)") {
+        $mm = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+        Set-RegVal $M "SystemResponsiveness=0"    $mm "SystemResponsiveness"   0
+        Set-RegVal $M "NetworkThrottlingIndex=Max" $mm "NetworkThrottlingIndex" 0xFFFFFFFF
+
+        $gm = "$mm\Tasks\Games"
+        Set-RegVal $M "Games GPU Priority=8"          $gm "GPU Priority"         8
+        Set-RegVal $M "Games Priority=6"              $gm "Priority"             6
+        Set-RegVal $M "Games SchedulingCat=High"      $gm "Scheduling Category"  "High" "String"
+        Set-RegVal $M "Games SFIO Priority=High"      $gm "SFIO Priority"        "High" "String"
+        Set-RegVal $M "Games Background Only=False"   $gm "Background Only"      "False" "String"
+        Set-RegVal $M "Games Clock Rate=10000"        $gm "Clock Rate"           10000
+    }
+    else { Record-Opt $M "MMCSS Gaming" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Win32 Priority Separation ─────────────────────────────
+    if (Ask-User "Aumentar prioridad de procesos en primer plano (Win32PrioritySeparation)?") {
+        Set-RegVal $M "Win32PrioritySeparation=38" `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" `
+            "Win32PrioritySeparation" 38
+    }
+    else { Record-Opt $M "Win32PrioritySeparation" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Timer del sistema / Dynamic Tick ─────────────────────
+    if (Ask-User "Optimizar timer del sistema? (reduce DPC latency via bcdedit)") {
+        try {
+            bcdedit /set useplatformclock false 2>$null | Out-Null
+            bcdedit /set disabledynamictick yes  2>$null | Out-Null
+            bcdedit /set tscsyncpolicy enhanced  2>$null | Out-Null
+            Record-Opt $M "Platform Clock / Dynamic Tick" 'APPLIED' "useplatformclock=off, dynamictick=off"
+        }
+        catch { Record-Opt $M "Timer del sistema" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "Timer del sistema" 'SKIPPED' "Omitido por usuario" }
+
+    # ── AMD CPPC Preferred Cores ──────────────────────────────
+    if ($Global:HW.IsAMDCPU) {
+        if (Ask-User "[AMD] Habilitar CPPC Preferred Cores para Ryzen? (mejor rendimiento en nucleos boost)") {
+            Set-RegVal $M "AMD CPPC PreferredCores" `
+                "HKLM:\SYSTEM\CurrentControlSet\Control\Power" `
+                "CppcPreferredCores" 1
+        }
+        else { Record-Opt $M "AMD CPPC Preferred Cores" 'SKIPPED' "Omitido por usuario" }
+    }
+
+    # ── Intel Spectre/Meltdown Mitigations [AVANZADO] ────────
+    if ($Global:HW.IsIntelCPU) {
+        if (Ask-User "[AVANZADO][INTEL] Desactivar mitigaciones Spectre/Meltdown? (gana rendimiento, reduce seguridad en PCs compartidas)") {
+            $mmPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+            Set-RegVal $M "SpectreMitigation Override"     $mmPath "FeatureSettingsOverride"     3
+            Set-RegVal $M "SpectreMitigation Override Mask" $mmPath "FeatureSettingsOverrideMask" 3
+        }
+        else { Record-Opt $M "Spectre/Meltdown Mitigations" 'SKIPPED' "Omitido por usuario" }
+    }
+
+    # ── Deshabilitar Hyper-V (si no se usa) ──────────────────
+    if (Ask-User "Deshabilitar Hyper-V? (libera recursos de CPU/RAM si no usas maquinas virtuales)") {
+        try {
+            bcdedit /set hypervisorlaunchtype off 2>$null | Out-Null
+            Record-Opt $M "Hyper-V Deshabilitado" 'APPLIED' "hypervisorlaunchtype=off (requiere reinicio)"
+        }
+        catch { Record-Opt $M "Hyper-V" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "Hyper-V" 'SKIPPED' "Omitido por usuario" }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 3 — MEMORIA
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-MemoryOptimization {
+    $M = "MEMORY"
+    if (-not (Ask-Module "MEMORY OPTIMIZATION" "RAM, PageFile, SysMain, Compresion, Prefetch")) { return }
+    Write-Header "MODULO MEMORIA"
+
+    # ── SysMain / Superfetch ──────────────────────────────────
+    if (Ask-User "Desactivar SysMain (Superfetch)? [recomendado para SSD/NVMe]") {
+        Disable-SvcSafe $M "SysMain" "SysMain (Superfetch)" "Disabled"
+    }
+    else { Record-Opt $M "SysMain" 'SKIPPED' "Omitido por usuario" }
+
+    # ── PageFile ──────────────────────────────────────────────
+    if (Ask-User "Optimizar tamano del archivo de paginacion (PageFile)?") {
+        try {
+            $ramGB = $Global:HW.RAMTotalGB
+            $minMB = [Math]::Max(1024, [int]($ramGB * 1024 * 0.25))
+            $maxMB = [Math]::Min(8192, [int]($ramGB * 1024 * 1.5))
+            $cs = Get-CimInstance Win32_ComputerSystem
+            $cs | Set-CimInstance -Property @{ AutomaticManagedPagefile = $false } -ErrorAction Stop
+            $pf = Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue
+            if ($pf) {
+                $pf | Set-CimInstance -Property @{ InitialSize = $minMB; MaximumSize = $maxMB }
+            }
+            else {
+                New-CimInstance -ClassName Win32_PageFileSetting `
+                    -Property @{ Name = "C:\pagefile.sys"; InitialSize = $minMB; MaximumSize = $maxMB } | Out-Null
+            }
+            Record-Opt $M "PageFile optimizado" 'APPLIED' "Min:${minMB}MB Max:${maxMB}MB"
+        }
+        catch { Record-Opt $M "PageFile" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "PageFile" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Memory Compression ────────────────────────────────────
+    if ($Global:HW.WinBuildInt -ge 17763) {
+        if (Ask-User "Desactivar compresion de memoria? (reduce CPU overhead en equipos con 16GB+ RAM)") {
+            try {
+                $agent = Get-MMAgent -ErrorAction Stop
+                if ($agent.MemoryCompression) {
+                    Disable-MMAgent -MemoryCompression -ErrorAction Stop
+                    Record-Opt $M "Memory Compression" 'APPLIED' "Desactivado"
+                }
+                else {
+                    Record-Opt $M "Memory Compression" 'SKIPPED' "Ya estaba desactivado"
+                }
+            }
+            catch { Record-Opt $M "Memory Compression" 'ERROR' $_.Exception.Message }
+        }
+        else { Record-Opt $M "Memory Compression" 'SKIPPED' "Omitido por usuario" }
+    }
+
+    # ── LargeSystemCache ──────────────────────────────────────
+    if (Ask-User "Optimizar LargeSystemCache para modo gaming?") {
+        $mmMgmt = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+        Set-RegVal $M "LargeSystemCache=0" $mmMgmt "LargeSystemCache" 0
+    }
+    else { Record-Opt $M "LargeSystemCache" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Deshabilitar paginacion del ejecutivo del kernel ──────
+    if (Ask-User "Mantener codigo del kernel en RAM? (DisablePagingExecutive, recomendado con 16GB+)") {
+        $mmMgmt = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+        Set-RegVal $M "DisablePagingExecutive=1" $mmMgmt "DisablePagingExecutive" 1
+        if ($Global:HW.L2CacheKB -gt 0) {
+            Set-RegVal $M "SecondLevelDataCache" $mmMgmt "SecondLevelDataCache" $Global:HW.L2CacheKB
+        }
+    }
+    else { Record-Opt $M "DisablePagingExecutive" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Prefetch / Superfetch para SSD ────────────────────────
+    if ($Global:HW.HasSSD -or $Global:HW.HasNVMe) {
+        if (Ask-User "Adaptar Prefetch para SSD/NVMe? (en SSD el prefetch es innecesario)") {
+            $pfPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
+            Set-RegVal $M "EnablePrefetcher=0"  $pfPath "EnablePrefetcher"  0
+            Set-RegVal $M "EnableBootTrace=0"   $pfPath "EnableBootTrace"   0
+        }
+        else { Record-Opt $M "Prefetch SSD" 'SKIPPED' "Omitido por usuario" }
+    }
+
+    # ── Limpiar memoria Standby ───────────────────────────────
+    if (Ask-User "Limpiar lista de memoria Standby ahora? (libera RAM inmediatamente)") {
+        try {
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+            [System.GC]::Collect()
+            # Si existe RAMMap CLI o EmptyStandbyList, usarlo
+            $esl = "$env:SystemRoot\System32\EmptyStandbyList.exe"
+            if (Test-Path $esl) {
+                & $esl workingsets     2>$null
+                & $esl modifiedpagelist 2>$null
+                & $esl standbylist     2>$null
+                Record-Opt $M "Standby List Cleared" 'APPLIED' "EmptyStandbyList ejecutado"
+            }
+            else {
+                Record-Opt $M "Standby List Cleared" 'APPLIED' "GC.Collect() ejecutado"
+            }
+        }
+        catch { Record-Opt $M "Standby List" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "Standby List" 'SKIPPED' "Omitido por usuario" }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 4 — GPU
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-GPUOptimization {
+    $M = "GPU"
+    if (-not (Ask-Module "GPU OPTIMIZATION" "NVIDIA/AMD/Intel, HAGS, Game Mode, DVR, latencia")) { return }
+    Write-Header "MODULO GPU"
+
+    # ── Game Mode ─────────────────────────────────────────────
+    if (Ask-User "Activar Game Mode de Windows?") {
+        $gb = "HKCU:\SOFTWARE\Microsoft\GameBar"
+        Set-RegVal $M "Game Mode AutoGameMode"   $gb "AutoGameModeEnabled" 1
+        Set-RegVal $M "Game Mode AllowAutoGame"  $gb "AllowAutoGameMode"   1
+    }
+    else { Record-Opt $M "Game Mode" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Desactivar Game DVR / Game Bar ────────────────────────
+    if (Ask-User "Desactivar Game DVR y Game Bar? (reduce overhead de captura en juegos)") {
+        $gc = "HKCU:\System\GameConfigStore"
+        Set-RegVal $M "GameDVR_Enabled=0"                   $gc "GameDVR_Enabled"                       0
+        Set-RegVal $M "GameDVR_FSEBehaviorMode=2"           $gc "GameDVR_FSEBehaviorMode"               2
+        Set-RegVal $M "GameDVR_HonorUserFSE=1"             $gc "GameDVR_HonorUserFSEBehaviorMode"      1
+        Set-RegVal $M "GameDVR_DXGIHonorFSE=1"            $gc "GameDVR_DXGIHonorFSEWindowsCompatible" 1
+        Set-RegVal $M "AppCaptureEnabled=0" `
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
+        Set-RegVal $M "AllowGameDVR=0" `
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
+    }
+    else { Record-Opt $M "Game DVR/Bar" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Hardware Accelerated GPU Scheduling (HAGS) ─────────────
+    if (Ask-User "Activar HAGS (Hardware Accelerated GPU Scheduling)? [requiere Win10 2004+ y GPU reciente]") {
+        if ($Global:HW.WinBuildInt -ge 19041) {
+            Set-RegVal $M "HAGS HwSchMode=2" `
+                "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode" 2
+        }
+        else {
+            Record-Opt $M "HAGS" 'NOT_FOUND' "Requiere Windows 10 2004+ (Build 19041+)"
+        }
+    }
+    else { Record-Opt $M "HAGS" 'SKIPPED' "Omitido por usuario" }
+
+    # ── NVIDIA Specific ───────────────────────────────────────
+    if ($Global:HW.HasNVIDIA) {
+        Write-Host ""
+        Write-Host "  [NVIDIA] GPU detectada: $($Global:HW.GPUPrimary)" -ForegroundColor Green
+
+        if (Ask-User "[NVIDIA] Aplicar tweaks de registro NVIDIA? (ULPS, PerfLevel, latencia)") {
+            $nvBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+            $nvKeys = Get-ChildItem -Path $nvBase -ErrorAction SilentlyContinue | Where-Object {
+                (Get-ItemProperty -Path $_.PSPath -Name "DriverDesc" -EA SilentlyContinue).DriverDesc -match "NVIDIA"
+            }
+            if ($nvKeys) {
+                foreach ($nk in $nvKeys) {
+                    Set-RegVal $M "NVIDIA ULPS Off"       $nk.PSPath "EnableUlps"    0
+                    Set-RegVal $M "NVIDIA ULPS N Off"     $nk.PSPath "EnableUlpsN"   0
+                    Set-RegVal $M "NVIDIA PerfLevelSrc"   $nk.PSPath "PerfLevelSrc"  0x2222
+                }
+            }
+            else {
+                Record-Opt $M "NVIDIA Registry Keys" 'NOT_FOUND' "No se encontraron entradas NVIDIA"
+            }
+            # Power saving del display
+            Set-RegVal $M "NVIDIA DisplayPowerSaving=0" `
+                "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak" `
+                "DisplayPowerSaving" 0
+        }
+        else { Record-Opt $M "NVIDIA Registry Tweaks" 'SKIPPED' "Omitido por usuario" }
+
+        if (Ask-User "[NVIDIA] Habilitar MSI Mode para driver NVIDIA? (reduce DPC latency)") {
+            Set-RegVal $M "NVIDIA EnableMSI=1" `
+                "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm" "EnableMSI" 1
+        }
+        else { Record-Opt $M "NVIDIA MSI Mode" 'SKIPPED' "Omitido por usuario" }
+    }
+
+    # ── AMD Specific ──────────────────────────────────────────
+    if ($Global:HW.HasAMDGPU) {
+        Write-Host ""
+        Write-Host "  [AMD Radeon] GPU detectada: $($Global:HW.GPUPrimary)" -ForegroundColor Red
+
+        if (Ask-User "[AMD] Aplicar tweaks de registro AMD Radeon? (thermal throttle, DMA, stutter)") {
+            $amdBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+            $amdKeys = Get-ChildItem -Path $amdBase -EA SilentlyContinue | Where-Object {
+                (Get-ItemProperty -Path $_.PSPath -Name "DriverDesc" -EA SilentlyContinue).DriverDesc -match "AMD|Radeon"
+            }
+            if ($amdKeys) {
+                foreach ($ak in $amdKeys) {
+                    Set-RegVal $M "AMD ThermalAutoThrottle=0" $ak.PSPath "PP_ThermalAutoThrottlingEnable" 0
+                    Set-RegVal $M "AMD DisableDMACopy=1"      $ak.PSPath "DisableDMACopy"                 1
+                    Set-RegVal $M "AMD StutterMode=0"         $ak.PSPath "StutterMode"                    0
+                }
+            }
+            else {
+                Record-Opt $M "AMD Registry Keys" 'NOT_FOUND' "No se encontraron entradas AMD"
+            }
+        }
+        else { Record-Opt $M "AMD Registry Tweaks" 'SKIPPED' "Omitido por usuario" }
+    }
+
+    # ── Intel iGPU ────────────────────────────────────────────
+    if ($Global:HW.HasIntelGPU -and -not $Global:HW.HasNVIDIA -and -not $Global:HW.HasAMDGPU) {
+        Write-Host ""
+        Write-Host "  [Intel iGPU] GPU integrada detectada" -ForegroundColor Blue
+        if (Ask-User "[Intel] Aplicar tweaks para GPU integrada Intel?") {
+            $intelBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+            $intelKeys = Get-ChildItem -Path $intelBase -EA SilentlyContinue | Where-Object {
+                (Get-ItemProperty -Path $_.PSPath -Name "DriverDesc" -EA SilentlyContinue).DriverDesc -match "Intel"
+            }
+            if ($intelKeys) {
+                foreach ($ik in $intelKeys) {
+                    Set-RegVal $M "Intel ComputePreemption=0" $ik.PSPath "KMD_EnableComputePreemption" 0
+                }
+            }
+            Record-Opt $M "Intel iGPU Tweaks" 'APPLIED' "ComputePreemption desactivado"
+        }
+        else { Record-Opt $M "Intel iGPU" 'SKIPPED' "Omitido por usuario" }
+    }
+
+    # ── Fullscreen Optimizations ──────────────────────────────
+    if (Ask-User "Desactivar Fullscreen Optimizations de Windows? (puede reducir latencia en modo exclusivo)") {
+        Set-RegVal $M "GameDVR_DSEBehavior=2" `
+            "HKCU:\System\GameConfigStore" "GameDVR_DSEBehavior" 2
+    }
+    else { Record-Opt $M "Fullscreen Optimizations" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Variable Refresh Rate ─────────────────────────────────
+    if (Ask-User "Habilitar Variable Refresh Rate (VRR/Adaptive Sync) en Windows?") {
+        Set-RegVal $M "VRR Enable" `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "VRR" 1
+    }
+    else { Record-Opt $M "Variable Refresh Rate" 'SKIPPED' "Omitido por usuario" }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 5 — ALMACENAMIENTO
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-StorageOptimization {
+    $M = "STORAGE"
+    if (-not (Ask-Module "STORAGE OPTIMIZATION" "NVMe/SSD/HDD tweaks, TRIM, NTFS, indexacion, cache")) { return }
+    Write-Header "MODULO ALMACENAMIENTO"
+
+    # ── NVMe Tweaks ───────────────────────────────────────────
+    if ($Global:HW.HasNVMe) {
+        if (Ask-User "[NVMe] Optimizar configuracion NVMe para latencia?") {
+            $nvmePath = "HKLM:\SYSTEM\CurrentControlSet\Services\stornvme\Parameters\Device"
+            Set-RegVal $M "NVMe FUA on Flush" $nvmePath "ForceFUAonFlush" 1
+            Record-Opt $M "NVMe optimizado" 'APPLIED' "FUA on Flush habilitado"
+        }
+        else { Record-Opt $M "NVMe Tweaks" 'SKIPPED' "Omitido por usuario" }
+    }
+
+    # ── NTFS Last Access Timestamp ────────────────────────────
+    if (Ask-User "Desactivar timestamps de ultimo acceso NTFS? (reduce escrituras en disco)") {
+        try {
+            $r = fsutil behavior set disableLastAccess 1 2>&1
+            Record-Opt $M "NTFS Last Access Disabled" 'APPLIED' "disableLastAccess=1"
+        }
+        catch { Record-Opt $M "NTFS Last Access" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "NTFS Last Access" 'SKIPPED' "Omitido por usuario" }
+
+    # ── NTFS 8.3 Filenames ────────────────────────────────────
+    if (Ask-User "Desactivar generacion de nombres 8.3 en NTFS? (reduce carga del sistema de archivos)") {
+        try {
+            fsutil behavior set disable8dot3 1 2>&1 | Out-Null
+            Record-Opt $M "NTFS 8.3 Filenames" 'APPLIED' "disable8dot3=1"
+        }
+        catch { Record-Opt $M "NTFS 8.3 Filenames" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "NTFS 8.3 Filenames" 'SKIPPED' "Omitido por usuario" }
+
+    # ── NTFS Memory Usage Level ───────────────────────────────
+    if (Ask-User "Optimizar uso de memoria NTFS? (nivel 2 = maximo rendimiento)") {
+        try {
+            fsutil behavior set memoryusage 2 2>&1 | Out-Null
+            Record-Opt $M "NTFS Memory Usage" 'APPLIED' "memoryusage=2"
+        }
+        catch { Record-Opt $M "NTFS Memory Usage" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "NTFS Memory Usage" 'SKIPPED' "Omitido por usuario" }
+
+    # ── TRIM para SSD/NVMe ────────────────────────────────────
+    if ($Global:HW.HasSSD -or $Global:HW.HasNVMe) {
+        if (Ask-User "Verificar y asegurar que TRIM este activo para SSD/NVMe?") {
+            try {
+                $trimStatus = fsutil behavior query disableDeleteNotify 2>&1
+                if ($trimStatus -match "NTFS.*= 0|ReFS.*= 0") {
+                    Record-Opt $M "TRIM Status" 'SKIPPED' "TRIM ya esta habilitado"
+                }
+                else {
+                    fsutil behavior set disableDeleteNotify 0 2>&1 | Out-Null
+                    Record-Opt $M "TRIM Enable" 'APPLIED' "disableDeleteNotify=0"
+                }
+            }
+            catch { Record-Opt $M "TRIM" 'ERROR' $_.Exception.Message }
+        }
+        else { Record-Opt $M "TRIM" 'SKIPPED' "Omitido por usuario" }
+
+        # ── Desactivar indexacion en SSD ──────────────────────
+        if (Ask-User "Desactivar indexacion de archivos en unidades SSD/NVMe?") {
+            try {
+                $vols = Get-WmiObject Win32_Volume -Filter "DriveType=3" -ErrorAction SilentlyContinue
+                foreach ($vol in $vols) {
+                    if ($vol.DriveLetter -and $vol.IndexingEnabled) {
+                        $vol.IndexingEnabled = $false
+                        $vol.Put() | Out-Null
+                        Record-Opt $M "Indexing Off ($($vol.DriveLetter))" 'APPLIED' "Indexacion desactivada"
+                    }
+                }
+            }
+            catch { Record-Opt $M "Disk Indexing" 'ERROR' $_.Exception.Message }
+        }
+        else { Record-Opt $M "Disk Indexing" 'SKIPPED' "Omitido por usuario" }
+    }
+
+    # ── StorAHCI MSI Mode (reduce DPC latency SATA) ───────────
+    if (Ask-User "Habilitar MSI Mode en controladores AHCI? (reduce DPC latency en SATA)") {
+        try {
+            $ahciPath = "HKLM:\SYSTEM\CurrentControlSet\Services\storahci\Parameters\Device"
+            if (-not (Test-Path $ahciPath)) { New-Item -Path $ahciPath -Force | Out-Null }
+            $existing = Get-ItemProperty -Path $ahciPath -Name "InterruptMsgMode" -EA SilentlyContinue
+            if ($null -eq $existing) {
+                Set-ItemProperty -Path $ahciPath -Name "InterruptMsgMode" -Value ([byte[]](3, 0)) -Type Binary
+                Record-Opt $M "StorAHCI MSI Mode" 'APPLIED' "InterruptMsgMode=3"
+            }
+            else {
+                Record-Opt $M "StorAHCI MSI Mode" 'SKIPPED' "Ya configurado"
+            }
+        }
+        catch { Record-Opt $M "StorAHCI MSI Mode" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "StorAHCI MSI Mode" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Write Caching ─────────────────────────────────────────
+    if (Ask-User "Optimizar cache de escritura en disco?") {
+        try {
+            $diskDrives = Get-WmiObject Win32_DiskDrive -ErrorAction SilentlyContinue
+            foreach ($dd in $diskDrives) {
+                $pnpKey = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dd.PNPDeviceID)\Device Parameters\Disk"
+                if (Test-Path $pnpKey) {
+                    Set-RegVal $M "WriteCacheEnabled ($($dd.Index))" $pnpKey "CacheIsPowerProtected" 1
+                }
+            }
+        }
+        catch { Record-Opt $M "Write Cache" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "Write Cache" 'SKIPPED' "Omitido por usuario" }
+
+    # ── HDD Specifics ─────────────────────────────────────────
+    if ($Global:HW.HasHDD -and -not $Global:HW.HasNVMe) {
+        if (Ask-User "[HDD] Habilitar prefetch y readyboost para HDD? (mejor lectura secuencial en HDD)") {
+            $pfPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
+            Set-RegVal $M "EnablePrefetcher=3 (HDD)" $pfPath "EnablePrefetcher" 3
+            Record-Opt $M "HDD Prefetch Mode" 'APPLIED' "EnablePrefetcher=3"
+        }
+        else { Record-Opt $M "HDD Prefetch" 'SKIPPED' "Omitido por usuario" }
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 6 — RED
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-NetworkOptimization {
+    $M = "NETWORK"
+    if (-not (Ask-Module "NETWORK OPTIMIZATION" "TCP/IP, Nagle, DNS gaming, adaptadores, stack")) { return }
+    Write-Header "MODULO RED"
+
+    $tcpPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+    Backup-RegKey "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" "TCPIP_Backup"
+
+    # ── Algoritmo de Nagle ────────────────────────────────────
+    if (Ask-User "Desactivar algoritmo de Nagle en todos los adaptadores? (reduce latencia TCP)") {
+        try {
+            $ifaces = Get-ChildItem "$tcpPath\Interfaces" -ErrorAction SilentlyContinue
+            $count = 0
+            foreach ($iface in $ifaces) {
+                $hasIP = (Get-ItemProperty -Path $iface.PSPath -EA SilentlyContinue).DhcpIPAddress `
+                    -or (Get-ItemProperty -Path $iface.PSPath -EA SilentlyContinue).IPAddress
+                Set-ItemProperty -Path $iface.PSPath -Name "TcpAckFrequency" -Value 1  -Type DWord -Force -EA SilentlyContinue
+                Set-ItemProperty -Path $iface.PSPath -Name "TCPNoDelay"      -Value 1  -Type DWord -Force -EA SilentlyContinue
+                Set-ItemProperty -Path $iface.PSPath -Name "TcpDelAckTicks"  -Value 0  -Type DWord -Force -EA SilentlyContinue
+                $count++
+            }
+            Record-Opt $M "Nagle Algorithm Disabled" 'APPLIED' "$count adaptadores configurados"
+        }
+        catch { Record-Opt $M "Nagle Algorithm" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "Nagle Algorithm" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Parametros TCP/IP ─────────────────────────────────────
+    if (Ask-User "Optimizar parametros TCP/IP para gaming? (TTL, MaxPort, TCP Window)") {
+        Set-RegVal $M "DefaultTTL=64"           $tcpPath "DefaultTTL"              64
+        Set-RegVal $M "MaxUserPort=65534"        $tcpPath "MaxUserPort"             65534
+        Set-RegVal $M "TcpTimedWaitDelay=30"     $tcpPath "TcpTimedWaitDelay"       30
+        Set-RegVal $M "GlobalMaxTcpWindowSize"   $tcpPath "GlobalMaxTcpWindowSize"  65535
+        Set-RegVal $M "Tcp1323Opts=1"            $tcpPath "Tcp1323Opts"             1
+        Set-RegVal $M "SackOpts=1"               $tcpPath "SackOpts"               1
+        Set-RegVal $M "EnablePMTUDiscovery=1"    $tcpPath "EnablePMTUDiscovery"     1
+        Set-RegVal $M "MaxConnectionsPerServer"  $tcpPath "MaxConnectionsPerServer" 0
+    }
+    else { Record-Opt $M "TCP/IP Parameters" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Network Throttling Index ──────────────────────────────
+    if (Ask-User "Desactivar limitacion de red de Windows? (NetworkThrottlingIndex)") {
+        Set-RegVal $M "NetworkThrottlingIndex=Max" `
+            "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" `
+            "NetworkThrottlingIndex" 0xFFFFFFFF
+    }
+    else { Record-Opt $M "NetworkThrottlingIndex" 'SKIPPED' "Omitido por usuario" }
+
+    # ── netsh TCP Stack ───────────────────────────────────────
+    if (Ask-User "Configurar stack TCP via netsh para gaming? (autotune, chimney, rss)") {
+        try {
+            netsh int tcp set global autotuninglevel=normal   2>$null | Out-Null
+            netsh int tcp set global chimney=disabled         2>$null | Out-Null
+            netsh int tcp set global rss=enabled              2>$null | Out-Null
+            netsh int tcp set global netdma=disabled          2>$null | Out-Null
+            netsh int tcp set global ecncapability=disabled   2>$null | Out-Null
+            netsh int tcp set global dca=disabled             2>$null | Out-Null
+            netsh int tcp set global congestionprovider=ctcp  2>$null | Out-Null
+            Record-Opt $M "TCP netsh Gaming Stack" 'APPLIED' "autotune=normal rss=on chimney=off"
+        }
+        catch { Record-Opt $M "TCP netsh" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "TCP netsh Stack" 'SKIPPED' "Omitido por usuario" }
+
+    # ── DNS Gaming ────────────────────────────────────────────
+    if (Ask-User "Configurar DNS gaming? (Cloudflare 1.1.1.1 + Google 8.8.8.8)") {
+        try {
+            $adapters = Get-NetAdapter -EA SilentlyContinue | Where-Object {
+                $_.Status -eq "Up" -and $_.InterfaceDescription -notmatch "Virtual|Loopback|Teredo|isatap"
+            }
+            foreach ($a in $adapters) {
+                Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex `
+                    -ServerAddresses @("1.1.1.1", "8.8.8.8", "1.0.0.1", "8.8.4.4") -EA SilentlyContinue
+                Record-Opt $M "DNS: $($a.Name)" 'APPLIED' "1.1.1.1 + 8.8.8.8"
+            }
+        }
+        catch { Record-Opt $M "DNS Gaming" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "DNS Gaming" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Adaptadores de red (propiedades avanzadas) ────────────
+    if (Ask-User "Optimizar adaptadores de red? (Interrupt Moderation, Buffers, Flow Control)") {
+        try {
+            $adapters = Get-NetAdapter -EA SilentlyContinue | Where-Object {
+                $_.Status -eq "Up" -and $_.InterfaceDescription -notmatch "Virtual|Loopback"
+            }
+            foreach ($a in $adapters) {
+                $advSettings = @{
+                    "*InterruptModeration" = "Disabled"
+                    "*FlowControl"         = "Disabled"
+                    "*EEE"                 = "Disabled"
+                }
+                foreach ($s in $advSettings.GetEnumerator()) {
+                    Set-NetAdapterAdvancedProperty -Name $a.Name `
+                        -RegistryKeyword $s.Key -RegistryValue 0 -EA SilentlyContinue
+                }
+                # Buffer sizes
+                Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName "Receive Buffers"  -DisplayValue "512" -EA SilentlyContinue
+                Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName "Transmit Buffers" -DisplayValue "512" -EA SilentlyContinue
+                Record-Opt $M "Adaptador: $($a.Name)" 'APPLIED' "InterruptMod=OFF, FlowCtrl=OFF, EEE=OFF"
+            }
+        }
+        catch { Record-Opt $M "Network Adapters" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "Network Adapters" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Desactivar NetBIOS ────────────────────────────────────
+    if (Ask-User "Desactivar NetBIOS sobre TCP/IP? (reduce overhead en red local gaming)") {
+        try {
+            $nics = Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object IPEnabled -eq $true
+            foreach ($nic in $nics) { $nic.SetTcpipNetbios(2) | Out-Null }
+            Record-Opt $M "NetBIOS over TCP/IP" 'APPLIED' "Desactivado en todos los NICs"
+        }
+        catch { Record-Opt $M "NetBIOS" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "NetBIOS" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Flush DNS ─────────────────────────────────────────────
+    if (Ask-User "Limpiar cache DNS?") {
+        try {
+            Clear-DnsClientCache -EA SilentlyContinue
+            ipconfig /flushdns 2>$null | Out-Null
+            Record-Opt $M "DNS Cache Flush" 'APPLIED' "Cache limpiado"
+        }
+        catch { Record-Opt $M "DNS Flush" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "DNS Flush" 'SKIPPED' "Omitido por usuario" }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 7 — INTERFAZ
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-InterfaceOptimization {
+    $M = "INTERFACE"
+    if (-not (Ask-Module "INTERFACE OPTIMIZATION" "Efectos visuales, transparencia, animaciones, DWM")) { return }
+    Write-Header "MODULO INTERFAZ"
+
+    # ── Efectos visuales para rendimiento ─────────────────────
+    if (Ask-User "Configurar efectos visuales para maximo rendimiento?") {
+        Set-RegVal $M "VisualFX Best Performance" `
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" `
+            "VisualFXSetting" 2
+
+        $adv = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+        Set-RegVal $M "Taskbar Animations Off"    $adv "TaskbarAnimations"   0
+        Set-RegVal $M "DragFullWindows Off"        $adv "DragFullWindows"     0
+        Set-RegVal $M "ListviewShadow Off"         $adv "ListviewShadow"      0
+        Set-RegVal $M "ShowTaskViewButton Off"     $adv "ShowTaskViewButton"  0
+
+        $desk = "HKCU:\Control Panel\Desktop"
+        Set-RegVal $M "MenuShowDelay=0"            $desk "MenuShowDelay"      "0" "String"
+        Set-RegVal $M "MinAnimate Off"             $desk "MinAnimate"         "0" "String"
+        Set-RegVal $M "FontSmoothing=2"            $desk "FontSmoothing"      "2" "String"
+
+        $explorer = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer"
+        Set-RegVal $M "AeroPeek Off"               $explorer "EnableAeroPeek" 0
+    }
+    else { Record-Opt $M "Visual Effects" 'SKIPPED' "Omitido por usuario" }
+
+    # ── UserPreferencesMask (todas las animaciones OFF) ────────
+    if (Ask-User "Desactivar TODAS las animaciones de ventanas via UserPreferencesMask?") {
+        try {
+            # Mascara que desactiva todas las animaciones
+            $mask = [byte[]](0x90, 0x12, 0x03, 0x80, 0x10, 0x00, 0x00, 0x00)
+            Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" `
+                -Name "UserPreferencesMask" -Value $mask -Type Binary -Force
+            Record-Opt $M "UserPreferencesMask" 'APPLIED' "Todas las animaciones desactivadas"
+        }
+        catch { Record-Opt $M "UserPreferencesMask" 'ERROR' $_.Exception.Message }
+    }
+    else { Record-Opt $M "UserPreferencesMask" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Transparencias ────────────────────────────────────────
+    if (Ask-User "Desactivar transparencias de Windows? (reduce GPU load del DWM)") {
+        $theme = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        Set-RegVal $M "EnableTransparency=0" $theme "EnableTransparency" 0
+        Set-RegVal $M "UseBlurBehind=0"      $theme "UseBlurBehind"      0
+    }
+    else { Record-Opt $M "Transparencias" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Cortana / Search Box ──────────────────────────────────
+    if (Ask-User "Desactivar Cortana y caja de busqueda en la barra de tareas?") {
+        Set-RegVal $M "Cortana AllowCortana=0" `
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "AllowCortana" 0
+        Set-RegVal $M "SearchboxMode=0" `
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 0
+    }
+    else { Record-Opt $M "Cortana/Search" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Widgets (Win11) ───────────────────────────────────────
+    if ($Global:HW.IsWin11) {
+        if (Ask-User "[Win11] Desactivar Widgets?") {
+            Set-RegVal $M "Widgets AllowNewsAndInterests=0" `
+                "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+        }
+        else { Record-Opt $M "Win11 Widgets" 'SKIPPED' "Omitido por usuario" }
+    }
+
+    # ── People icon / Taskbar Cleanup ─────────────────────────
+    if (Ask-User "Limpiar barra de tareas? (People icon, Task View button)") {
+        Set-RegVal $M "PeopleBand=0" `
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced\People" "PeopleBand" 0
+    }
+    else { Record-Opt $M "Taskbar Cleanup" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Cursor Blink Rate ─────────────────────────────────────
+    if (Ask-User "Optimizar blink rate del cursor? (puede reducir micro-interrupciones)") {
+        Set-RegVal $M "CursorBlinkRate=-1" `
+            "HKCU:\Control Panel\Desktop" "CursorBlinkRate" "-1" "String"
+        Set-RegVal $M "CursorShadow=0" `
+            "HKCU:\Control Panel\Cursors" "CursorShadow" 0
+    }
+    else { Record-Opt $M "Cursor Settings" 'SKIPPED' "Omitido por usuario" }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 8 — SERVICIOS
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-ServicesOptimization {
+    $M = "SERVICES"
+    if (-not (Ask-Module "SERVICES OPTIMIZATION" "Deshabilitar servicios innecesarios (compatibilidad anticheat)")) { return }
+    Write-Header "MODULO SERVICIOS"
+
+    # ── Telemetria y Diagnosticos ─────────────────────────────
+    if (Ask-User "Desactivar servicios de telemetria y diagnostico?") {
+        $tSvcs = @(
+            @{N = "DiagTrack"; L = "Telemetria (DiagTrack)"; T = "Disabled" }
+            @{N = "dmwappushservice"; L = "WAP Push Service"; T = "Disabled" }
+            @{N = "WerSvc"; L = "Windows Error Reporting"; T = "Disabled" }
+            @{N = "PcaSvc"; L = "Program Compatibility Assistant"; T = "Disabled" }
+            @{N = "wisvc"; L = "Windows Insider Service"; T = "Disabled" }
+            @{N = "DiagnosticHub.StandardCollector.Service"; L = "Diagnostic Hub Collector"; T = "Disabled" }
+        )
+        foreach ($s in $tSvcs) { Disable-SvcSafe $M $s.N $s.L $s.T }
+    }
+    else { Record-Opt $M "Telemetry Services" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Medios e Impresion ────────────────────────────────────
+    if (Ask-User "Desactivar servicios de impresion y multimedia? (Fax, WMP Network, WIA)") {
+        $mSvcs = @(
+            @{N = "Fax"; L = "Fax Service"; T = "Disabled" }
+            @{N = "WMPNetworkSvc"; L = "WMP Network Sharing"; T = "Disabled" }
+            @{N = "PrintNotify"; L = "Printer Extensions & Notifications"; T = "Disabled" }
+            @{N = "stisvc"; L = "Windows Image Acquisition (WIA)"; T = "Disabled" }
+            @{N = "Spooler"; L = "Print Spooler"; T = "Manual" }
+        )
+        foreach ($s in $mSvcs) { Disable-SvcSafe $M $s.N $s.L $s.T }
+    }
+    else { Record-Opt $M "Media/Print Services" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Acceso remoto y ubicacion ─────────────────────────────
+    if (Ask-User "Desactivar servicios de acceso remoto y ubicacion?") {
+        $rSvcs = @(
+            @{N = "RemoteAccess"; L = "Routing and Remote Access"; T = "Disabled" }
+            @{N = "RemoteRegistry"; L = "Remote Registry"; T = "Disabled" }
+            @{N = "SharedAccess"; L = "Internet Connection Sharing"; T = "Disabled" }
+            @{N = "lfsvc"; L = "Geolocation Service"; T = "Disabled" }
+            @{N = "MapsBroker"; L = "Downloaded Maps Manager"; T = "Disabled" }
+        )
+        foreach ($s in $rSvcs) { Disable-SvcSafe $M $s.N $s.L $s.T }
+    }
+    else { Record-Opt $M "Remote Services" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Servicios de tablet / Smart Card / Parental ───────────
+    if (Ask-User "Desactivar servicios innecesarios? (Tablet, Smart Card, Parental Controls, Retail Demo)") {
+        $xSvcs = @(
+            @{N = "RetailDemo"; L = "Retail Demo Service"; T = "Disabled" }
+            @{N = "WpcMonSvc"; L = "Parental Controls"; T = "Disabled" }
+            @{N = "TabletInputService"; L = "Touch Keyboard/Handwriting"; T = "Disabled" }
+            @{N = "SCardSvr"; L = "Smart Card"; T = "Disabled" }
+            @{N = "PhoneSvc"; L = "Phone Service"; T = "Disabled" }
+            @{N = "icssvc"; L = "Mobile Hotspot Service"; T = "Disabled" }
+            @{N = "CDPSvc"; L = "Connected Devices Platform"; T = "Disabled" }
+            @{N = "CloudIDSvc"; L = "Microsoft Cloud Identity"; T = "Disabled" }
+        )
+        foreach ($s in $xSvcs) { Disable-SvcSafe $M $s.N $s.L $s.T }
+    }
+    else { Record-Opt $M "Misc Services" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Windows Search ────────────────────────────────────────
+    if (Ask-User "Poner Windows Search en modo Manual? (libera RAM pero desactiva indexado rapido)") {
+        Disable-SvcSafe $M "WSearch" "Windows Search" "Manual"
+    }
+    else { Record-Opt $M "Windows Search" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Bluetooth (si no se usa) ──────────────────────────────
+    if (Ask-User "Desactivar servicios Bluetooth? (solo si NO usas mouse/headset bluetooth)") {
+        Disable-SvcSafe $M "BTAGService" "Bluetooth Audio Gateway" "Disabled"
+        Disable-SvcSafe $M "bthserv"     "Bluetooth Support"       "Disabled"
+    }
+    else { Record-Opt $M "Bluetooth Services" 'SKIPPED' "Omitido por usuario" }
+
+    # Nota de seguridad: servicios que NO desactivamos
+    Write-Host ""
+    Write-Host "  [INFO] Servicios CONSERVADOS (criticos para gaming/anticheat):" -ForegroundColor DarkCyan
+    @("Xbox Live Auth (XblAuthManager)", "Xbox Game Save (XblGameSave)", "Xbox Networking (XboxNetApiSvc)",
+        "Windows Update (wuauserv)", "Windows Defender (WinDefend)", "Event Log (EventLog)",
+        "DirectX (DXGKrnl)", "Windows Audio (AudioSrv)") | ForEach-Object {
+        Write-Host "    [+] $_" -ForegroundColor DarkGreen
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 9 — TAREAS PROGRAMADAS
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-ScheduledTasksOptimization {
+    $M = "TASKS"
+    if (-not (Ask-Module "SCHEDULED TASKS" "Deshabilitar tareas de telemetria y diagnosticos innecesarias")) { return }
+    Write-Header "MODULO TAREAS PROGRAMADAS"
+
+    $tasks = @(
+        @{P = "\Microsoft\Windows\Application Experience\"; N = "Microsoft Compatibility Appraiser" }
+        @{P = "\Microsoft\Windows\Application Experience\"; N = "ProgramDataUpdater" }
+        @{P = "\Microsoft\Windows\Application Experience\"; N = "StartupAppTask" }
+        @{P = "\Microsoft\Windows\Application Experience\"; N = "AitAgent" }
+        @{P = "\Microsoft\Windows\Autochk\"; N = "Proxy" }
+        @{P = "\Microsoft\Windows\Customer Experience Improvement Program\"; N = "Consolidator" }
+        @{P = "\Microsoft\Windows\Customer Experience Improvement Program\"; N = "UsbCeip" }
+        @{P = "\Microsoft\Windows\Customer Experience Improvement Program\"; N = "KernelCeipTask" }
+        @{P = "\Microsoft\Windows\Device Information\"; N = "Device" }
+        @{P = "\Microsoft\Windows\DiskDiagnostic\"; N = "Microsoft-Windows-DiskDiagnosticDataCollector" }
+        @{P = "\Microsoft\Windows\Feedback\Siuf\"; N = "DmClient" }
+        @{P = "\Microsoft\Windows\Feedback\Siuf\"; N = "DmClientOnScenarioDownload" }
+        @{P = "\Microsoft\Windows\NetTrace\"; N = "GatherNetworkInfo" }
+        @{P = "\Microsoft\Windows\Power Efficiency Diagnostics\"; N = "AnalyzeSystem" }
+        @{P = "\Microsoft\Windows\Shell\"; N = "FamilySafetyMonitor" }
+        @{P = "\Microsoft\Windows\Shell\"; N = "FamilySafetyRefreshTask" }
+        @{P = "\Microsoft\Windows\Windows Error Reporting\"; N = "QueueReporting" }
+        @{P = "\Microsoft\Windows\Maps\"; N = "MapsUpdateTask" }
+        @{P = "\Microsoft\Windows\Maps\"; N = "MapsToastTask" }
+        @{P = "\Microsoft\Windows\Maintenance\"; N = "WinSAT" }
+        @{P = "\Microsoft\Windows\MUI\"; N = "LPRemove" }
+        @{P = "\Microsoft\Windows\Location\"; N = "WindowsActionDialog" }
+        @{P = "\Microsoft\Windows\PI\"; N = "Sqm-Tasks" }
+        @{P = "\Microsoft\Windows\Speech\"; N = "SpeechModelDownloadTask" }
+    )
+
+    if (Ask-User "Desactivar $($tasks.Count) tareas programadas de telemetria/diagnostico?") {
+        foreach ($t in $tasks) {
+            try {
+                $task = Get-ScheduledTask -TaskPath $t.P -TaskName $t.N -ErrorAction SilentlyContinue
+                if ($null -eq $task) {
+                    Record-Opt $M $t.N 'NOT_FOUND' "Tarea no existe"
+                }
+                elseif ($task.State -eq "Disabled") {
+                    Record-Opt $M $t.N 'SKIPPED' "Ya desactivada"
+                }
+                else {
+                    Disable-ScheduledTask -TaskPath $t.P -TaskName $t.N -ErrorAction Stop | Out-Null
+                    Record-Opt $M $t.N 'APPLIED' "Desactivada"
+                }
+            }
+            catch { Record-Opt $M $t.N 'ERROR' $_.Exception.Message }
+        }
+    }
+    else { Record-Opt $M "Scheduled Tasks (todas)" 'SKIPPED' "Modulo omitido" }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULO 10 — TELEMETRIA Y PRIVACIDAD
+# ══════════════════════════════════════════════════════════════════════════════
+function Invoke-TelemetryOptimization {
+    $M = "TELEMETRY"
+    if (-not (Ask-Module "TELEMETRY & PRIVACY" "Reducir recoleccion de datos sin afectar estabilidad")) { return }
+    Write-Header "MODULO TELEMETRIA Y PRIVACIDAD"
+
+    Backup-RegKey "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "Telemetry_Backup"
+
+    # ── Telemetria principal ──────────────────────────────────
+    if (Ask-User "Desactivar telemetria principal de Windows? (AllowTelemetry=0)") {
+        Set-RegVal $M "AllowTelemetry=0 (Policy)" `
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 0
+        Set-RegVal $M "AllowTelemetry=0 (MS)" `
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" "AllowTelemetry" 0
+        Set-RegVal $M "MaxTelemetryAllowed=0" `
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" "MaxTelemetryAllowed" 0
+        Set-RegVal $M "CEIP Disabled" `
+            "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" "CEIPEnable" 0
+    }
+    else { Record-Opt $M "Core Telemetry" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Feedback y SIUF ───────────────────────────────────────
+    if (Ask-User "Desactivar notificaciones de feedback y SIUF?") {
+        Set-RegVal $M "SIUF NumberOfSIUF=0" `
+            "HKCU:\SOFTWARE\Microsoft\Siuf\Rules" "NumberOfSIUFInPeriod" 0
+        Set-RegVal $M "SIUF PeriodInNano=0" `
+            "HKCU:\SOFTWARE\Microsoft\Siuf\Rules" "PeriodInNanoSeconds" 0
+        Set-RegVal $M "DoNotShowFeedback" `
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "DoNotShowFeedbackNotifications" 1
+    }
+    else { Record-Opt $M "Feedback/SIUF" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Advertising ID ────────────────────────────────────────
+    if (Ask-User "Desactivar Advertising ID de Windows?") {
+        Set-RegVal $M "AdvertisingInfo Enabled=0" `
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 0
+        Set-RegVal $M "AdvertisingInfo Policy" `
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo" "DisabledByGroupPolicy" 1
+    }
+    else { Record-Opt $M "Advertising ID" 'SKIPPED' "Omitido por usuario" }
+
+    # ── Error Reporting ───────────────────────────────────────
+    if (Ask-User "Desactivar Windows Error Reporting?") {
+        Set-RegVal $M "WER Disabled=1" `
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting" `
+            "Disabled" `
+            1
+    }
+
+}
